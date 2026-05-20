@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fast synthetic reference test for v4.2.2 origin-based training.
+Fast synthetic reference test for v4.2.3 origin-based training.
 No Home Assistant required. This intentionally uses a simple ridge-like least squares
 model so it runs quickly on small systems; the deployed AppDaemon app uses
 HistGradientBoostingRegressor.
@@ -61,6 +61,7 @@ def install_app_import_stubs() -> None:
 install_app_import_stubs()
 
 from powersync_ml_forecaster import DEFAULT_CFG, PowerSyncMLForecaster  # noqa: E402
+from standalone_runner import StandaloneForecaster  # noqa: E402
 
 rng = np.random.default_rng(42)
 interval_min = 5
@@ -197,3 +198,108 @@ def run_odd_minute_origin_training_test() -> None:
 
 
 run_odd_minute_origin_training_test()
+
+
+class FakeResponse:
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text}")
+
+
+class FakeSession:
+    def __init__(self):
+        self.posts = []
+
+    def get(self, *_args, **_kwargs):
+        return FakeResponse(404, None, "")
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.posts.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
+        return FakeResponse(201, {"entity_id": "sensor.hafo_power_sync_home_load_forecast"}, "")
+
+
+class ConstantModel:
+    def predict(self, frame):
+        return np.full(len(frame), 1.234, dtype=float)
+
+
+def run_training_cycle_publish_test() -> None:
+    app = StandaloneForecaster.__new__(StandaloneForecaster)
+    app.args = {}
+    app.cfg = dict(DEFAULT_CFG)
+    app.cfg.update({
+        "load_sensor": "sensor.synthetic_load",
+        "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
+        "friendly_name": "HAFO Load Forecast",
+        "timezone": "UTC",
+        "base_interval_minutes": 5,
+        "training_lead_interval_minutes": 15,
+        "publish_interval_minutes": 5,
+        "horizon_hours": 48,
+        "weather_enabled": False,
+    })
+    app.tz = timezone.utc
+    app.holiday_cal = None
+    app.model = None
+    app.feature_cols = []
+    app.training_frame = None
+    app.validation_metrics = {"model_mae_kw": 0.123}
+    app.last_train_time = None
+    app.last_error = None
+    app._session = FakeSession()
+    app._headers = {"Authorization": "Bearer fake", "Content-Type": "application/json"}
+    app._ha_url = "http://supervisor/core"
+    app.logs = []
+    app.log = lambda msg, level="INFO", **_kwargs: app.logs.append((level, msg))
+    app._save_model_cache = lambda: None
+    app._write_latest_forecast = lambda _forecast: None
+    app._append_snapshot = lambda _forecast: None
+    app._fetch_weather_live = lambda _forecast_days: pd.DataFrame()
+
+    def successful_training():
+        idx = pd.date_range("2026-01-01T00:00:00Z", periods=8 * points_per_day, freq="5min")
+        app.training_frame = pd.DataFrame({
+            "baseline_load_kw": np.full(len(idx), 0.9, dtype=float),
+            "ev_charging_flag": np.zeros(len(idx), dtype=float),
+        }, index=idx)
+        app.model = ConstantModel()
+        app.feature_cols = ["lead_minutes"]
+
+    app._train_validate_refit_and_forecast = successful_training
+
+    app._train_callback({})
+
+    forecast_posts = [
+        post for post in app._session.posts
+        if post["url"] == "http://supervisor/core/api/states/sensor.hafo_power_sync_home_load_forecast"
+        and post["json"]["attributes"].get("forecast")
+    ]
+    assert forecast_posts, (
+        "training cycle did not publish the HAFO forecast sensor; "
+        f"posts={app._session.posts!r} logs={app.logs!r} last_error={app.last_error!r}"
+    )
+    payload = forecast_posts[-1]["json"]
+    attrs = payload["attributes"]
+    assert payload["state"] == "1.234", f"unexpected published state: {payload['state']}"
+    assert attrs["status"] == "ok"
+    assert attrs["source"] == "powersync_ml_forecaster"
+    assert attrs["unit_of_measurement"] == "kW"
+    assert attrs["friendly_name"] == "HAFO Load Forecast"
+    assert len(attrs["forecast"]) == 576, f"unexpected forecast length: {len(attrs['forecast'])}"
+    log_text = "\n".join(msg for _level, msg in app.logs)
+    assert "Training cycle complete" in log_text
+    assert "Generating forecast for sensor.hafo_power_sync_home_load_forecast" in log_text
+    assert "Publishing forecast sensor sensor.hafo_power_sync_home_load_forecast" in log_text
+    assert "Published forecast sensor sensor.hafo_power_sync_home_load_forecast status=201" in log_text
+    print(f"Training publish test: posts={len(app._session.posts)} forecast_entries={len(attrs['forecast'])}")
+
+
+run_training_cycle_publish_test()

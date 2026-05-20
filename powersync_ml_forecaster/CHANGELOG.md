@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.2.3
+
+- Publish the HAFO forecast as an explicit post-training step with success/failure logs.
+- Log Home Assistant state publish HTTP status and response body excerpts on failure.
+- Use `powersync_ml_forecaster` as the published source attribute.
+- Add synthetic coverage proving the HAFO state publish is called after training.
+
 ## 4.2.2
 
 - Adjust validation split cutoff when the requested validation window lands beyond the latest usable training origin.

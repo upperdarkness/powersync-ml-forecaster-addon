@@ -1,4 +1,4 @@
-"""Standalone Home Assistant add-on runner for PowerSync ML Load Forecaster v4.2.2.
+"""Standalone Home Assistant add-on runner for PowerSync ML Load Forecaster v4.2.3.
 
 This wrapper lets the AppDaemon-oriented forecaster run as a normal Home
 Assistant add-on. It provides the small subset of AppDaemon methods used by the
@@ -112,6 +112,12 @@ class StandaloneForecaster(PowerSyncMLForecaster):
             "Content-Type": "application/json",
         }
         self._ha_url = args.get("ha_url") or "http://supervisor/core"
+        token_source = "configured"
+        if token == os.environ.get("SUPERVISOR_TOKEN"):
+            token_source = "SUPERVISOR_TOKEN"
+        elif token == os.environ.get("HASS_TOKEN"):
+            token_source = "HASS_TOKEN"
+        self.log(f"Home Assistant Core API base URL: {self._ha_url.rstrip('/')}; token_source={token_source}")
 
     # AppDaemon compatibility methods -------------------------------------------------
     def log(self, msg: str, level: str = "INFO", **_: Any) -> None:
@@ -144,10 +150,18 @@ class StandaloneForecaster(PowerSyncMLForecaster):
             return data.get("attributes", {}).get(attribute)
         return data.get("state")
 
-    def set_state(self, entity_id: str, state: str, attributes: Optional[Dict[str, Any]] = None) -> None:
+    def set_state(self, entity_id: str, state: str, attributes: Optional[Dict[str, Any]] = None) -> int:
         payload = {"state": state, "attributes": attributes or {}}
-        r = self._session.post(self._url(f"/api/states/{entity_id}"), headers=self._headers, json=payload, timeout=20)
-        r.raise_for_status()
+        url = self._url(f"/api/states/{entity_id}")
+        r = self._session.post(url, headers=self._headers, json=payload, timeout=20)
+        if r.status_code >= 400:
+            body = (r.text or "")[:500]
+            self.log(
+                f"Home Assistant state publish failed for {entity_id}: status={r.status_code} body={body}",
+                level="ERROR",
+            )
+            r.raise_for_status()
+        return int(r.status_code)
 
     def get_history(self, entity_id: str, start_time: str, end_time: str, **_: Any) -> Any:
         params = {

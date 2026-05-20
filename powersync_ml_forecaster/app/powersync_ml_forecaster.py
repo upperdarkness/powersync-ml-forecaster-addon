@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.2.2
+PowerSync ML Load Forecaster v4.2.3
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -58,11 +58,11 @@ OPEN_METEO_VARS = [
     "is_day",
 ]
 
-FORECASTER_VERSION = "4.2.2"
+FORECASTER_VERSION = "4.2.3"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
-    "friendly_name": "HAFO PowerSync ML Load Forecast",
+    "friendly_name": "HAFO Load Forecast",
     "load_sensor": None,
     "load_unit_override": None,
     "ev_power_sensor": None,
@@ -219,6 +219,8 @@ class PowerSyncMLForecaster(hass.Hass):
         cfg["ha_url"] = cfg.get("ha_url") or os.environ.get("HASS_URL") or "http://supervisor/core"
         cfg["ha_token"] = cfg.get("ha_token") or os.environ.get("HASS_TOKEN") or os.environ.get("SUPERVISOR_TOKEN")
         cfg["days_back"] = int(min(max(cfg["days_back"], 14), 365))
+        if cfg.get("friendly_name") == "HAFO PowerSync ML Load Forecast":
+            cfg["friendly_name"] = DEFAULT_CFG["friendly_name"]
         if cfg["publish_interval_minutes"] < cfg["base_interval_minutes"]:
             cfg["publish_interval_minutes"] = cfg["base_interval_minutes"]
         return cfg
@@ -235,18 +237,24 @@ class PowerSyncMLForecaster(hass.Hass):
 
     def _train_callback(self, kwargs):
         try:
-            self._publish_status("training", "Training started")
+            try:
+                self._publish_status("training", "Training started")
+            except Exception:
+                self.log("Failed to publish training status:\n" + traceback.format_exc(), level="ERROR")
             t0 = time.time()
             self._train_validate_refit_and_forecast()
             elapsed = time.time() - t0
             self.last_train_time = utc_now()
             self._save_model_cache()
-            self._publish_status("ok", "")
             self.log(f"Training cycle complete in {elapsed:.1f}s")
+            self._refresh_forecast()
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             self.last_error = err
-            self._publish_status("error", err)
+            try:
+                self._publish_status("error", err)
+            except Exception:
+                self.log("Failed to publish error status:\n" + traceback.format_exc(), level="ERROR")
             self.log(traceback.format_exc(), level="ERROR")
 
     def _forecast_callback(self, kwargs):
@@ -254,8 +262,9 @@ class PowerSyncMLForecaster(hass.Hass):
             return
         try:
             self._refresh_forecast()
-        except Exception as e:
-            self.log(f"Forecast refresh failed: {e}", level="WARNING")
+        except Exception:
+            self.last_error = traceback.format_exc()
+            self.log("Forecast refresh failed:\n" + self.last_error, level="ERROR")
 
     def _load_cached_model_if_valid(self) -> bool:
         if not self.model_path.exists():
@@ -319,7 +328,6 @@ class PowerSyncMLForecaster(hass.Hass):
         all_rows = self._subsample_training_rows(all_rows)
         self.model = self._new_model()
         self.model.fit(all_rows[self.feature_cols].astype(float), all_rows["target_load_kw"].astype(float))
-        self._refresh_forecast()
 
     def _new_model(self) -> HistGradientBoostingRegressor:
         return HistGradientBoostingRegressor(
@@ -733,8 +741,14 @@ class PowerSyncMLForecaster(hass.Hass):
         raise RuntimeError(f"Quality gate failed. Metrics: {json.dumps(metrics)[:1000]}")
 
     def _refresh_forecast(self):
-        if self.model is None or self.training_frame is None or not self.feature_cols:
-            return
+        entity_id = self.cfg["hafo_entity_id"]
+        self.log(f"Generating forecast for {entity_id}")
+        if self.model is None:
+            raise RuntimeError("Cannot generate forecast: model is not trained")
+        if self.training_frame is None:
+            raise RuntimeError("Cannot generate forecast: training frame is unavailable")
+        if not self.feature_cols:
+            raise RuntimeError("Cannot generate forecast: feature columns are unavailable")
         now = utc_now()
         pub_interval = int(self.cfg["publish_interval_minutes"])
         train_lead_interval = int(self.cfg["training_lead_interval_minutes"])
@@ -764,6 +778,8 @@ class PowerSyncMLForecaster(hass.Hass):
         preds_coarse = np.clip(self.model.predict(X[self.feature_cols].astype(float)), 0, None)
         publish_leads = np.arange(pub_interval, horizon_minutes + 1, pub_interval, dtype=int)
         preds_publish = np.interp(publish_leads, coarse_leads, preds_coarse)
+        if len(preds_publish) == 0:
+            raise RuntimeError("Cannot publish forecast: generated forecast is empty")
         forecast = []
         daily_totals: Dict[str, float] = {}
         for lead, value in zip(publish_leads, preds_publish):
@@ -797,11 +813,12 @@ class PowerSyncMLForecaster(hass.Hass):
             "unit_of_measurement": "kW",
             "device_class": "power",
             "state_class": "measurement",
-            "source": "powersync_ml_forecaster_v4_2",
+            "source": "powersync_ml_forecaster",
         })
         self.set_state(self.cfg["hafo_entity_id"], state=state, attributes=attrs)
 
     def _publish_forecast(self, forecast: List[dict], predictions: np.ndarray, daily_totals: Dict[str, float]):
+        entity_id = self.cfg["hafo_entity_id"]
         attrs = {
             "forecast": forecast,
             "status": "ok",
@@ -809,11 +826,12 @@ class PowerSyncMLForecaster(hass.Hass):
             "unit_of_measurement": "kW",
             "device_class": "power",
             "state_class": "measurement",
-            "source": "powersync_ml_forecaster_v4_2",
+            "source": "powersync_ml_forecaster",
             "source_entity": self.cfg["load_sensor"],
             "last_updated": utc_now().astimezone(self.tz).isoformat(),
             "last_trained": self.last_train_time.astimezone(self.tz).isoformat() if self.last_train_time else None,
             "horizon_hours": self.cfg["horizon_hours"],
+            "interval_minutes": self.cfg["publish_interval_minutes"],
             "publish_interval_minutes": self.cfg["publish_interval_minutes"],
             "training_lead_interval_minutes": self.cfg["training_lead_interval_minutes"],
             "interpolation_mode": "predict_training_leads_then_linear_interpolate_to_publish_interval",
@@ -826,7 +844,12 @@ class PowerSyncMLForecaster(hass.Hass):
             "daily_forecast_kwh": {k: round(v, 2) for k, v in daily_totals.items()},
         }
         state = str(round(float(predictions[0]), 3)) if len(predictions) else "0"
-        self.set_state(self.cfg["hafo_entity_id"], state=state, attributes=attrs)
+        self.log(f"Publishing forecast sensor {entity_id}")
+        status_code = self.set_state(entity_id, state=state, attributes=attrs)
+        if status_code is None:
+            self.log(f"Published forecast sensor {entity_id} status=unknown")
+        else:
+            self.log(f"Published forecast sensor {entity_id} status={status_code}")
 
     def _ev_excluded_kwh(self) -> Optional[float]:
         if self.training_frame is None or "ev_excluded_kw" not in self.training_frame:
@@ -840,7 +863,7 @@ class PowerSyncMLForecaster(hass.Hass):
             "entity_id": self.cfg["hafo_entity_id"],
             "forecast": forecast,
             "unit_of_measurement": "kW",
-            "source": "powersync_ml_forecaster_v4_2",
+            "source": "powersync_ml_forecaster",
         }
         tmp = self.latest_forecast_path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as f:
