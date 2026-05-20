@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.2.1
+PowerSync ML Load Forecaster v4.2.2
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -58,7 +58,7 @@ OPEN_METEO_VARS = [
     "is_day",
 ]
 
-FORECASTER_VERSION = "4.2.1"
+FORECASTER_VERSION = "4.2.2"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",

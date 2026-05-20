@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.2.2
+
+- Adjust validation split cutoff when the requested validation window lands beyond the latest usable training origin.
+- Add synthetic coverage for late validation cutoff fallback.
+
 ## 4.2.1
 
 - Align prepared training indexes to configured interval boundaries.
