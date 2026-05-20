@@ -1,5 +1,9 @@
 # Changelog
 
+## 4.3.1
+
+- Add progress logging for larger statistics-backed training runs.
+
 ## 4.3.0
 
 - Add Home Assistant recorder statistics fallback for older load history outside detailed recorder retention.

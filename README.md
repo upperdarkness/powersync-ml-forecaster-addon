@@ -1,6 +1,6 @@
 # PowerSync ML Forecaster Add-on Repository
 
-This repository packages the PowerSync ML Load Forecaster v4.3.0 as a Home Assistant add-on.
+This repository packages the PowerSync ML Load Forecaster v4.3.1 as a Home Assistant add-on.
 
 It publishes a HAFO-compatible baseline household load forecast sensor for PowerSync, with EV charging excluded from the training target so one-off EV charging sessions are less likely to be repeated in the next day forecast.
 

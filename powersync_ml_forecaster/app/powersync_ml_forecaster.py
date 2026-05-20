@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.3.0
+PowerSync ML Load Forecaster v4.3.1
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -58,7 +58,7 @@ OPEN_METEO_VARS = [
     "is_day",
 ]
 
-FORECASTER_VERSION = "4.3.0"
+FORECASTER_VERSION = "4.3.1"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
@@ -312,14 +312,21 @@ class PowerSyncMLForecaster(hass.Hass):
         if len(base.dropna(subset=["baseline_load_kw"])) < required_points:
             raise RuntimeError(self._insufficient_history_message(base))
         self.training_frame = base
+        self.log(
+            "Prepared training base frame: "
+            f"rows={len(base)} usable_baseline_rows={int(base['baseline_load_kw'].notna().sum())} "
+            f"usable_baseline_days={self.history_diagnostics.get('usable_baseline_days')}"
+        )
 
         validation_cutoff = now - timedelta(days=int(self.cfg["validation_days"]))
         train_rows, val_rows = self._build_origin_training_table(base, start, now, validation_cutoff)
         if train_rows.empty or val_rows.empty:
             raise RuntimeError("Unable to build non-empty train and validation tables")
+        self.log(f"Built origin training rows: train={len(train_rows)} validation={len(val_rows)}")
 
         model_for_validation = self._new_model()
         self.feature_cols = [c for c in train_rows.columns if c not in ("target_load_kw", "target_time", "origin_time", "lead_bucket")]
+        self.log(f"Fitting validation model: rows={len(train_rows)} features={len(self.feature_cols)}")
         model_for_validation.fit(train_rows[self.feature_cols].astype(float), train_rows["target_load_kw"].astype(float))
         val_pred = np.clip(model_for_validation.predict(val_rows[self.feature_cols].astype(float)), 0, None)
         self.validation_metrics = self._compute_validation_metrics(val_rows, val_pred)
@@ -328,8 +335,10 @@ class PowerSyncMLForecaster(hass.Hass):
         # Standard deployment refit: train final model on all eligible data including validation period.
         all_rows = pd.concat([train_rows, val_rows], ignore_index=True)
         all_rows = self._subsample_training_rows(all_rows)
+        self.log(f"Fitting final model: rows={len(all_rows)} features={len(self.feature_cols)}")
         self.model = self._new_model()
         self.model.fit(all_rows[self.feature_cols].astype(float), all_rows["target_load_kw"].astype(float))
+        self.log("Final model fit complete")
 
     def _new_model(self) -> HistGradientBoostingRegressor:
         return HistGradientBoostingRegressor(
@@ -556,10 +565,16 @@ class PowerSyncMLForecaster(hass.Hass):
         origins = pd.date_range(earliest_origin.ceil(f"{origin_interval}min"), latest_origin.floor(f"{origin_interval}min"), freq=f"{origin_interval}min", tz="UTC")
         leads = np.arange(lead_interval, horizon_minutes + 1, lead_interval, dtype=int)
         weather_hist = self._fetch_weather_training(start, end) if self.cfg["weather_enabled"] else pd.DataFrame()
+        self.log(
+            "Building origin training table: "
+            f"candidate_origins={len(origins)} leads_per_origin={len(leads)} "
+            f"estimated_max_rows={len(origins) * len(leads)}"
+        )
         chunks = []
         rejected_missing_origin_features = 0
         rejected_missing_targets = 0
-        for origin in origins:
+        progress_started = time.time()
+        for origin_idx, origin in enumerate(origins, start=1):
             origin_features = self._features_known_at_origin(base, origin)
             if origin_features is None:
                 rejected_missing_origin_features += 1
@@ -586,6 +601,15 @@ class PowerSyncMLForecaster(hass.Hass):
                 chunks.append(pd.DataFrame(rows))
             else:
                 rejected_missing_targets += 1
+            if origin_idx % 250 == 0 or (time.time() - progress_started > 60 and origin_idx < len(origins)):
+                built_rows = sum(len(chunk) for chunk in chunks)
+                self.log(
+                    "Origin training progress: "
+                    f"origins_processed={origin_idx}/{len(origins)} rows_built={built_rows} "
+                    f"rejected_missing_origin_features={rejected_missing_origin_features} "
+                    f"rejected_missing_targets={rejected_missing_targets}"
+                )
+                progress_started = time.time()
         if not chunks:
             self.log(
                 "No origin training rows built: "

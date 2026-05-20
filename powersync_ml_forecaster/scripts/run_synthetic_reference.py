@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fast synthetic reference test for v4.3.0 origin-based training.
+Fast synthetic reference test for v4.3.1 origin-based training.
 No Home Assistant required. This intentionally uses a simple ridge-like least squares
 model so it runs quickly on small systems; the deployed AppDaemon app uses
 HistGradientBoostingRegressor.
