@@ -1,0 +1,107 @@
+name: PowerSync ML Forecaster
+version: "4.2.0"
+slug: powersync_ml_forecaster
+description: ML baseline household load forecaster that publishes a HAFO-compatible forecast sensor for PowerSync.
+url: https://github.com/upperdarkness/powersync-ml-forecaster-addon
+author: David R
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: services
+boot: auto
+init: false
+homeassistant_api: true
+map:
+  - share:rw
+options:
+  load_sensor: ""
+  hafo_entity_id: "sensor.hafo_power_sync_home_load_forecast"
+  friendly_name: "HAFO PowerSync ML Load Forecast"
+  load_unit_override: ""
+  ev_power_sensor: ""
+  ev_power_unit_override: ""
+  ev_exclusion_threshold_kw: 0.5
+  import_price_sensor: ""
+  feed_in_price_sensor: ""
+  additional_feature_sensors: []
+  latitude: -35.07
+  longitude: 138.54
+  timezone: "Australia/Adelaide"
+  public_holiday_region: "SA"
+  days_back: 60
+  minimum_training_days: 21
+  horizon_hours: 48
+  base_interval_minutes: 5
+  training_origin_interval_minutes: 60
+  training_lead_interval_minutes: 15
+  publish_interval_minutes: 5
+  retrain_minutes: 360
+  update_minutes: 15
+  validation_days: 14
+  max_training_rows: 250000
+  history_fetch_chunk_days: 7
+  max_total_history_fetch_seconds: 600
+  max_single_history_chunk_seconds: 90
+  max_training_frame_mb: 600
+  weather_enabled: true
+  weather_training_mode: "historical_forecast_proxy"
+  price_training_mode: "origin_current_price_only"
+  use_live_price_forecast_features: false
+  data_dir: "/share/powersync_ml_forecaster"
+  cache_max_age_hours: 24
+  snapshot_retention_days: 30
+  require_quality_gate: false
+  min_model_improvement_pct: 5.0
+  ev_artifact_min_false_load_reduction_pct: 50.0
+  ev_artifact_min_mae_improvement_pct: 20.0
+  model_max_iter: 300
+  model_learning_rate: 0.06
+  model_max_depth: 6
+  model_min_samples_leaf: 20
+schema:
+  load_sensor: str
+  hafo_entity_id: str
+  friendly_name: str
+  load_unit_override: str?
+  ev_power_sensor: str?
+  ev_power_unit_override: str?
+  ev_exclusion_threshold_kw: float
+  import_price_sensor: str?
+  feed_in_price_sensor: str?
+  additional_feature_sensors:
+    - str
+  latitude: float
+  longitude: float
+  timezone: str
+  public_holiday_region: str?
+  days_back: int
+  minimum_training_days: int
+  horizon_hours: int
+  base_interval_minutes: int
+  training_origin_interval_minutes: int
+  training_lead_interval_minutes: int
+  publish_interval_minutes: int
+  retrain_minutes: int
+  update_minutes: int
+  validation_days: int
+  max_training_rows: int
+  history_fetch_chunk_days: int
+  max_total_history_fetch_seconds: int
+  max_single_history_chunk_seconds: int
+  max_training_frame_mb: int
+  weather_enabled: bool
+  weather_training_mode: list(historical_forecast_proxy|archive_api_fallback|disabled)
+  price_training_mode: list(origin_current_price_only|historical_target_price_proxy|disabled)
+  use_live_price_forecast_features: bool
+  data_dir: str
+  cache_max_age_hours: int
+  snapshot_retention_days: int
+  require_quality_gate: bool
+  min_model_improvement_pct: float
+  ev_artifact_min_false_load_reduction_pct: float
+  ev_artifact_min_mae_improvement_pct: float
+  model_max_iter: int
+  model_learning_rate: float
+  model_max_depth: int
+  model_min_samples_leaf: int
