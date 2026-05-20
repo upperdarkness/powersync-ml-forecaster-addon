@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.3.0
+
+- Add Home Assistant recorder statistics fallback for older load history outside detailed recorder retention.
+- Merge detailed state, short-term statistics, and long-term statistics into the baseline training frame with `history_source` diagnostics.
+- Keep EV exclusion limited to detailed state history rows.
+
 ## 4.2.3
 
 - Publish the HAFO forecast as an explicit post-training step with success/failure logs.

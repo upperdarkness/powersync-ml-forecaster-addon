@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fast synthetic reference test for v4.2.3 origin-based training.
+Fast synthetic reference test for v4.3.0 origin-based training.
 No Home Assistant required. This intentionally uses a simple ridge-like least squares
 model so it runs quickly on small systems; the deployed AppDaemon app uses
 HistGradientBoostingRegressor.
@@ -200,6 +200,63 @@ def run_odd_minute_origin_training_test() -> None:
 run_odd_minute_origin_training_test()
 
 
+def run_statistics_history_fallback_test() -> None:
+    start = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    end = start + timedelta(days=30)
+    detail_start = end - timedelta(days=10)
+    detailed_points = 10 * points_per_day
+    detailed_times = [detail_start + timedelta(minutes=interval_min * i) for i in range(detailed_points)]
+    detailed_load = 1.0 + 0.25 * np.sin(2 * np.pi * np.arange(detailed_points) / points_per_day)
+    detailed_history = [
+        {"last_changed": ts.isoformat(), "state": f"{float(value):.5f}"}
+        for ts, value in zip(detailed_times, detailed_load)
+    ]
+    stats_records = []
+    hourly_points = 30 * 24
+    for i in range(hourly_points):
+        ts = start + timedelta(hours=i)
+        value = 0.85 + 0.2 * math.sin(2 * math.pi * (ts.hour / 24.0))
+        stats_records.append({"start": int(ts.timestamp() * 1000), "mean": value})
+
+    app = PowerSyncMLForecaster.__new__(PowerSyncMLForecaster)
+    app.cfg = dict(DEFAULT_CFG)
+    app.cfg.update({
+        "load_sensor": "sensor.synthetic_load",
+        "load_unit_override": "kW",
+        "minimum_training_days": 14,
+        "base_interval_minutes": interval_min,
+        "timezone": "UTC",
+    })
+    app.history_diagnostics = {}
+    app.get_state = lambda *_args, **_kwargs: "kW"
+    app.log = lambda *_args, **_kwargs: None
+
+    base = app._build_base_frame({
+        "load": detailed_history,
+        "load_short_term_statistics": [],
+        "load_long_term_statistics": stats_records,
+    }, start, end)
+    required_points = app.cfg["minimum_training_days"] * 24 * 60 // app.cfg["base_interval_minutes"]
+    assert base["baseline_load_kw"].notna().sum() >= required_points
+    counts = app.history_diagnostics["history_source_counts"]
+    assert counts.get("detailed_state", 0) > 0
+    assert counts.get("long_term_statistics", 0) > 0
+    stats_rows = base["history_source"] == "long_term_statistics"
+    assert (base.loc[stats_rows, "ev_excluded_kw"] == 0).all()
+    assert np.allclose(
+        base.loc[stats_rows, "baseline_load_kw"].head(20),
+        base.loc[stats_rows, "raw_load_kw"].head(20),
+    )
+    print(
+        "Statistics fallback test: "
+        f"usable_days={app.history_diagnostics['usable_baseline_days']} "
+        f"sources={app.history_diagnostics['history_source_counts']}"
+    )
+
+
+run_statistics_history_fallback_test()
+
+
 class FakeResponse:
     def __init__(self, status_code, payload=None, text=""):
         self.status_code = status_code
@@ -252,6 +309,7 @@ def run_training_cycle_publish_test() -> None:
     app.feature_cols = []
     app.training_frame = None
     app.validation_metrics = {"model_mae_kw": 0.123}
+    app.history_diagnostics = {}
     app.last_train_time = None
     app.last_error = None
     app._session = FakeSession()

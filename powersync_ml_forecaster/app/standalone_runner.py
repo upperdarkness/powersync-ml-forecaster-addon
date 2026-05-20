@@ -1,4 +1,4 @@
-"""Standalone Home Assistant add-on runner for PowerSync ML Load Forecaster v4.2.3.
+"""Standalone Home Assistant add-on runner for PowerSync ML Load Forecaster v4.3.0.
 
 This wrapper lets the AppDaemon-oriented forecaster run as a normal Home
 Assistant add-on. It provides the small subset of AppDaemon methods used by the
@@ -138,6 +138,14 @@ class StandaloneForecaster(PowerSyncMLForecaster):
     def _url(self, path: str) -> str:
         return f"{self._ha_url.rstrip('/')}/{path.lstrip('/')}"
 
+    def _websocket_url(self) -> str:
+        base = self._ha_url.rstrip("/")
+        if base.startswith("https://"):
+            base = "wss://" + base[len("https://"):]
+        elif base.startswith("http://"):
+            base = "ws://" + base[len("http://"):]
+        return f"{base}/api/websocket"
+
     def get_state(self, entity_id: str, attribute: Optional[str] = None) -> Any:
         r = self._session.get(self._url(f"/api/states/{entity_id}"), headers=self._headers, timeout=20)
         if r.status_code == 404:
@@ -177,6 +185,39 @@ class StandaloneForecaster(PowerSyncMLForecaster):
         )
         r.raise_for_status()
         return r.json()
+
+    def get_statistics(self, entity_id: str, start_time: str, end_time: str, period: str, statistic_types: Optional[list] = None) -> Any:
+        try:
+            import websocket
+        except Exception as e:
+            raise RuntimeError(f"websocket-client is required for recorder statistics: {e}") from e
+
+        ws = websocket.create_connection(self._websocket_url(), timeout=60)
+        try:
+            hello = json.loads(ws.recv())
+            if hello.get("type") != "auth_required":
+                raise RuntimeError(f"Unexpected websocket greeting: {hello}")
+            token = self._headers["Authorization"].removeprefix("Bearer ")
+            ws.send(json.dumps({"type": "auth", "access_token": token}))
+            auth = json.loads(ws.recv())
+            if auth.get("type") != "auth_ok":
+                raise RuntimeError(f"Home Assistant websocket authentication failed: {auth}")
+            command = {
+                "id": 1,
+                "type": "recorder/statistics_during_period",
+                "start_time": start_time,
+                "end_time": end_time,
+                "statistic_ids": [entity_id],
+                "period": period,
+                "types": statistic_types or ["mean"],
+            }
+            ws.send(json.dumps(command))
+            response = json.loads(ws.recv())
+            if not response.get("success", False):
+                raise RuntimeError(f"Recorder statistics API rejected request: {response}")
+            return response.get("result", {})
+        finally:
+            ws.close()
 
     # Standalone lifecycle -----------------------------------------------------------
     def stop(self, *_: Any) -> None:

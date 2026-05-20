@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.2.3
+PowerSync ML Load Forecaster v4.3.0
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -58,7 +58,7 @@ OPEN_METEO_VARS = [
     "is_day",
 ]
 
-FORECASTER_VERSION = "4.2.3"
+FORECASTER_VERSION = "4.3.0"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
@@ -181,6 +181,7 @@ class PowerSyncMLForecaster(hass.Hass):
         self.model: Optional[HistGradientBoostingRegressor] = None
         self.training_frame: Optional[pd.DataFrame] = None
         self.validation_metrics: Dict[str, Any] = {}
+        self.history_diagnostics: Dict[str, Any] = {}
         self.last_train_time: Optional[datetime] = None
         self.last_error: Optional[str] = None
         self.holiday_cal = self._build_holiday_calendar()
@@ -307,8 +308,9 @@ class PowerSyncMLForecaster(hass.Hass):
         start = now - timedelta(days=int(self.cfg["days_back"]))
         sensor_data = self._fetch_all_histories_chunked(start, now)
         base = self._build_base_frame(sensor_data, start, now)
-        if len(base.dropna(subset=["baseline_load_kw"])) < self.cfg["minimum_training_days"] * 24 * 60 // self.cfg["base_interval_minutes"]:
-            raise RuntimeError("Insufficient baseline load history after preparation")
+        required_points = self.cfg["minimum_training_days"] * 24 * 60 // self.cfg["base_interval_minutes"]
+        if len(base.dropna(subset=["baseline_load_kw"])) < required_points:
+            raise RuntimeError(self._insufficient_history_message(base))
         self.training_frame = base
 
         validation_cutoff = now - timedelta(days=int(self.cfg["validation_days"]))
@@ -369,7 +371,35 @@ class PowerSyncMLForecaster(hass.Hass):
                 cursor = chunk_end
             result[key] = records
             self.log(f"Fetched {len(records)} records for {entity}")
+        load_entity = self.cfg["load_sensor"]
+        result["load_short_term_statistics"] = self._fetch_load_statistics(load_entity, start, end, "5minute")
+        result["load_long_term_statistics"] = self._fetch_load_statistics(load_entity, start, end, "hour")
         return result
+
+    def _fetch_load_statistics(self, entity_id: str, start: datetime, end: datetime, period: str) -> List[dict]:
+        try:
+            stats = self.get_statistics(entity_id, start.isoformat(), end.isoformat(), period=period, statistic_types=["mean"])
+            records = self._extract_statistics_records(stats, entity_id)
+            self.log(f"Fetched {len(records)} {period} statistics records for {entity_id}")
+            return records
+        except AttributeError:
+            self.log("Recorder statistics unavailable in this runtime; detailed history only", level="WARNING")
+        except Exception as e:
+            self.log(f"Recorder statistics fetch failed for {entity_id} period={period}: {e}", level="WARNING")
+        return []
+
+    def _extract_statistics_records(self, stats: Any, entity_id: str) -> List[dict]:
+        if not stats:
+            return []
+        if isinstance(stats, list):
+            return [r for r in stats if isinstance(r, dict)]
+        if isinstance(stats, dict):
+            if entity_id in stats and isinstance(stats[entity_id], list):
+                return [r for r in stats[entity_id] if isinstance(r, dict)]
+            result = stats.get("result")
+            if isinstance(result, dict) and entity_id in result and isinstance(result[entity_id], list):
+                return [r for r in result[entity_id] if isinstance(r, dict)]
+        return []
 
     def _fetch_history(self, entity_id: str, start: datetime, end: datetime) -> List[dict]:
         try:
@@ -396,21 +426,42 @@ class PowerSyncMLForecaster(hass.Hass):
         idx_start, idx_end = aligned_interval_bounds(start, end, interval)
         idx = pd.date_range(start=idx_start, end=idx_end, freq=f"{interval}min")
         df = pd.DataFrame(index=idx)
+        load_unit = self.cfg.get("load_unit_override") or self.get_state(self.cfg["load_sensor"], attribute="unit_of_measurement")
+        load_detailed = self._history_to_series(sensor_data.get("load", []), idx, interval)
+        load_short = self._statistics_to_series(sensor_data.get("load_short_term_statistics", []), idx, interval, "short_term_statistics")
+        load_long = self._statistics_to_series(sensor_data.get("load_long_term_statistics", []), idx, interval, "long_term_statistics")
+        if load_detailed is not None:
+            df["load"] = load_detailed
+        else:
+            df["load"] = np.nan
+        df["raw_load_kw"] = convert_power_to_kw(df["load"], load_unit)
+        df["history_source"] = pd.Series(index=idx, dtype="object")
+        df.loc[df["raw_load_kw"].notna(), "history_source"] = "detailed_state"
+        for source_name, series in [("short_term_statistics", load_short), ("long_term_statistics", load_long)]:
+            if series is None:
+                continue
+            stats_kw = convert_power_to_kw(series, load_unit)
+            fill_mask = df["raw_load_kw"].isna() & stats_kw.notna()
+            df.loc[fill_mask, "raw_load_kw"] = stats_kw.loc[fill_mask]
+            df.loc[fill_mask, "history_source"] = source_name
         for key, hist in sensor_data.items():
+            if key in ("load", "load_short_term_statistics", "load_long_term_statistics"):
+                continue
             series = self._history_to_series(hist, idx, interval)
             if series is not None:
                 df[key] = series
-        load_unit = self.cfg.get("load_unit_override") or self.get_state(self.cfg["load_sensor"], attribute="unit_of_measurement")
-        df["raw_load_kw"] = convert_power_to_kw(df["load"], load_unit)
         if "ev_power" in df:
             ev_unit = self.cfg.get("ev_power_unit_override") or self.get_state(self.cfg["ev_power_sensor"], attribute="unit_of_measurement")
             df["ev_power_kw"] = convert_power_to_kw(df["ev_power"], ev_unit).fillna(0)
         else:
             df["ev_power_kw"] = 0.0
-        charging = df["ev_power_kw"] >= float(self.cfg["ev_exclusion_threshold_kw"])
+        detailed_load = df["history_source"] == "detailed_state"
+        charging = detailed_load & (df["ev_power_kw"] >= float(self.cfg["ev_exclusion_threshold_kw"]))
         df["ev_excluded_kw"] = np.where(charging, df["ev_power_kw"], 0.0)
-        df["baseline_load_kw"] = np.maximum(df["raw_load_kw"] - df["ev_excluded_kw"], 0)
+        df["baseline_load_kw"] = np.where(detailed_load, np.maximum(df["raw_load_kw"] - df["ev_excluded_kw"], 0), df["raw_load_kw"])
         df["ev_charging_flag"] = charging.astype(float)
+        self.history_diagnostics = self._history_diagnostics(df, start, end)
+        self.log(f"History diagnostics: {json.dumps(self.history_diagnostics, sort_keys=True)}")
         mem_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
         if mem_mb > float(self.cfg["max_training_frame_mb"]):
             raise RuntimeError(f"Prepared base frame memory {mem_mb:.1f} MB exceeds limit")
@@ -431,6 +482,70 @@ class PowerSyncMLForecaster(hass.Hass):
         s = pd.Series([v for _, v in rows], index=pd.DatetimeIndex([t for t, _ in rows])).sort_index()
         s = s.resample(f"{interval}min").last()
         return s.reindex(idx, method="ffill", limit=max(1, int(60 / interval)))
+
+    def _statistics_to_series(self, records: List[dict], idx: pd.DatetimeIndex, interval: int, source: str) -> Optional[pd.Series]:
+        rows = []
+        for rec in records or []:
+            ts = rec.get("start") or rec.get("start_time") or rec.get("start_ts")
+            if ts is None:
+                continue
+            if isinstance(ts, (int, float)):
+                unit = "ms" if float(ts) > 100000000000 else "s"
+                ts = pd.to_datetime(float(ts), unit=unit, utc=True)
+            else:
+                ts = pd.to_datetime(ts, utc=True)
+            val = safe_float(rec.get("mean"))
+            if pd.isna(val):
+                continue
+            rows.append((ts, val))
+        if not rows:
+            return None
+        s = pd.Series([v for _, v in rows], index=pd.DatetimeIndex([t for t, _ in rows])).sort_index()
+        if source == "long_term_statistics":
+            limit = max(1, int(60 / interval) - 1)
+            return s.reindex(idx, method="ffill", limit=limit)
+        return s.resample(f"{interval}min").mean().reindex(idx, method="nearest", tolerance=pd.Timedelta(minutes=float(interval) / 2.0))
+
+    def _history_diagnostics(self, base: pd.DataFrame, start: datetime, end: datetime) -> Dict[str, Any]:
+        counts = {str(k): int(v) for k, v in base["history_source"].fillna("missing").value_counts().to_dict().items()}
+        detailed_days = self._span_days(base.index[base["history_source"] == "detailed_state"])
+        stats_days = self._span_days(base.index[base["history_source"].isin(["short_term_statistics", "long_term_statistics"])])
+        usable_points = int(base["baseline_load_kw"].notna().sum())
+        usable_days = round(usable_points * int(self.cfg["base_interval_minutes"]) / 1440.0, 2)
+        return {
+            "detailed_history_days_available": detailed_days,
+            "statistics_history_days_available": stats_days,
+            "history_source_counts": counts,
+            "usable_baseline_days": usable_days,
+        }
+
+    def _span_days(self, index: pd.DatetimeIndex) -> float:
+        if len(index) == 0:
+            return 0.0
+        if len(index) == 1:
+            return round(int(self.cfg["base_interval_minutes"]) / 1440.0, 2)
+        return round((index.max() - index.min()).total_seconds() / 86400.0, 2)
+
+    def _insufficient_history_message(self, base: pd.DataFrame) -> str:
+        diag = self.history_diagnostics or self._history_diagnostics(base, utc_now(), utc_now())
+        usable = diag.get("usable_baseline_days", 0)
+        detailed = diag.get("detailed_history_days_available", 0)
+        stats = diag.get("statistics_history_days_available", 0)
+        counts = diag.get("history_source_counts", {})
+        reason = "recorder history retention"
+        if stats <= 0:
+            reason = "missing recorder statistics"
+        elif usable < float(self.cfg["minimum_training_days"]):
+            reason = "recorder history retention and insufficient usable recorder statistics"
+        return (
+            "Insufficient baseline load history after preparation: "
+            f"minimum_training_days={self.cfg['minimum_training_days']} "
+            f"usable_baseline_days={usable} "
+            f"detailed_history_days_available={detailed} "
+            f"statistics_history_days_available={stats} "
+            f"history_source_counts={counts} "
+            f"limitation={reason}"
+        )
 
     def _build_origin_training_table(self, base: pd.DataFrame, start: datetime, end: datetime, validation_cutoff: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
         origin_interval = int(self.cfg["training_origin_interval_minutes"])
@@ -837,6 +952,7 @@ class PowerSyncMLForecaster(hass.Hass):
             "interpolation_mode": "predict_training_leads_then_linear_interpolate_to_publish_interval",
             "model": "HistGradientBoostingRegressor_absolute_error",
             "validation": self.validation_metrics,
+            "history_diagnostics": getattr(self, "history_diagnostics", {}),
             "weather_training_mode": self.cfg["weather_training_mode"],
             "price_training_mode": self.cfg["price_training_mode"],
             "ev_exclusion_threshold_kw": self.cfg["ev_exclusion_threshold_kw"],
