@@ -188,6 +188,11 @@ def run_odd_minute_origin_training_test() -> None:
     shifted_train_rows, shifted_val_rows = app._build_origin_training_table(shifted_base, odd_start, end, validation_cutoff)
     assert not shifted_train_rows.empty, "nearest origin matching produced no training rows"
     assert not shifted_val_rows.empty, "nearest origin matching produced no validation rows"
+
+    late_cutoff = end
+    fallback_train_rows, fallback_val_rows = app._build_origin_training_table(base, odd_start, end, late_cutoff)
+    assert not fallback_train_rows.empty, "late validation cutoff fallback produced no training rows"
+    assert not fallback_val_rows.empty, "late validation cutoff fallback produced no validation rows"
     print(f"Odd-minute origin rows: train={len(train_rows):,} validation={len(val_rows):,}")
 
 

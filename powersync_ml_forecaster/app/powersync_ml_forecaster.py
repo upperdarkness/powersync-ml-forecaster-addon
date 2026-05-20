@@ -480,10 +480,51 @@ class PowerSyncMLForecaster(hass.Hass):
             raise RuntimeError("No origin training rows built")
         table = pd.concat(chunks, ignore_index=True)
         table = table.replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        train = table[pd.to_datetime(table["origin_time"], utc=True) < validation_cutoff].copy()
-        val = table[pd.to_datetime(table["origin_time"], utc=True) >= validation_cutoff].copy()
+        train, val = self._split_train_validation_rows(table, validation_cutoff)
+        if train.empty or val.empty:
+            self.log(
+                "Unable to build non-empty train and validation tables: "
+                f"total_rows={len(table)} "
+                f"unique_origins={pd.to_datetime(table['origin_time'], utc=True).nunique()} "
+                f"requested_validation_cutoff={self._format_optional_timestamp(pd.to_datetime(validation_cutoff, utc=True))} "
+                f"first_row_origin={self._format_optional_timestamp(pd.to_datetime(table['origin_time'], utc=True).min())} "
+                f"last_row_origin={self._format_optional_timestamp(pd.to_datetime(table['origin_time'], utc=True).max())}",
+                level="ERROR",
+            )
         train = self._subsample_training_rows(train)
         return train, val
+
+    def _split_train_validation_rows(self, table: pd.DataFrame, validation_cutoff: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        origin_times = pd.to_datetime(table["origin_time"], utc=True)
+        requested_cutoff = pd.to_datetime(validation_cutoff, utc=True)
+        train_mask = origin_times < requested_cutoff
+        val_mask = origin_times >= requested_cutoff
+        if train_mask.any() and val_mask.any():
+            return table[train_mask].copy(), table[val_mask].copy()
+
+        unique_origins = pd.DatetimeIndex(origin_times.drop_duplicates().sort_values())
+        if len(unique_origins) < 2:
+            return table[train_mask].copy(), table[val_mask].copy()
+
+        if not val_mask.any():
+            effective_cutoff = unique_origins[-1]
+        elif not train_mask.any():
+            effective_cutoff = unique_origins[1]
+        else:
+            effective_cutoff = requested_cutoff
+
+        self.log(
+            "Adjusted validation cutoff to keep non-empty train and validation tables: "
+            f"requested_validation_cutoff={self._format_optional_timestamp(requested_cutoff)} "
+            f"effective_validation_cutoff={self._format_optional_timestamp(effective_cutoff)} "
+            f"first_row_origin={self._format_optional_timestamp(unique_origins[0])} "
+            f"last_row_origin={self._format_optional_timestamp(unique_origins[-1])} "
+            f"unique_origins={len(unique_origins)}",
+            level="WARNING",
+        )
+        train_mask = origin_times < effective_cutoff
+        val_mask = origin_times >= effective_cutoff
+        return table[train_mask].copy(), table[val_mask].copy()
 
     def _features_known_at_origin(self, base: pd.DataFrame, origin: pd.Timestamp) -> Optional[Dict[str, float]]:
         matched_origin = self._nearest_index_timestamp(base.index, origin)
