@@ -1,4 +1,4 @@
-"""Standalone Home Assistant add-on runner for PowerSync ML Load Forecaster v4.2.
+"""Standalone Home Assistant add-on runner for PowerSync ML Load Forecaster v4.2.1.
 
 This wrapper lets the AppDaemon-oriented forecaster run as a normal Home
 Assistant add-on. It provides the small subset of AppDaemon methods used by the

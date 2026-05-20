@@ -1,12 +1,66 @@
 #!/usr/bin/env python3
 """
-Fast synthetic reference test for v4.2 origin-based training.
+Fast synthetic reference test for v4.2.1 origin-based training.
 No Home Assistant required. This intentionally uses a simple ridge-like least squares
 model so it runs quickly on small systems; the deployed AppDaemon app uses
 HistGradientBoostingRegressor.
 """
+import sys
 import math
+import types
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+
+APP_DIR = Path(__file__).resolve().parents[1] / "app"
+sys.path.insert(0, str(APP_DIR))
+
+
+def install_app_import_stubs() -> None:
+    try:
+        import requests  # noqa: F401
+    except ModuleNotFoundError:
+        requests_stub = types.ModuleType("requests")
+        requests_stub.get = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("requests is unavailable"))
+        sys.modules["requests"] = requests_stub
+
+    try:
+        import joblib  # noqa: F401
+    except ModuleNotFoundError:
+        joblib_stub = types.ModuleType("joblib")
+        joblib_stub.dump = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("joblib is unavailable"))
+        joblib_stub.load = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("joblib is unavailable"))
+        sys.modules["joblib"] = joblib_stub
+
+    try:
+        import sklearn.ensemble  # noqa: F401
+        import sklearn.metrics  # noqa: F401
+    except ModuleNotFoundError:
+        sklearn_stub = types.ModuleType("sklearn")
+        ensemble_stub = types.ModuleType("sklearn.ensemble")
+        metrics_stub = types.ModuleType("sklearn.metrics")
+
+        class UnavailableHistGradientBoostingRegressor:
+            def __init__(self, *_args, **_kwargs):
+                raise RuntimeError("scikit-learn is unavailable")
+
+        def mean_absolute_error(y_true, y_pred):
+            return float(np.mean(np.abs(np.asarray(y_true, dtype=float) - np.asarray(y_pred, dtype=float))))
+
+        ensemble_stub.HistGradientBoostingRegressor = UnavailableHistGradientBoostingRegressor
+        metrics_stub.mean_absolute_error = mean_absolute_error
+        sklearn_stub.ensemble = ensemble_stub
+        sklearn_stub.metrics = metrics_stub
+        sys.modules["sklearn"] = sklearn_stub
+        sys.modules["sklearn.ensemble"] = ensemble_stub
+        sys.modules["sklearn.metrics"] = metrics_stub
+
+
+install_app_import_stubs()
+
+from powersync_ml_forecaster import DEFAULT_CFG, PowerSyncMLForecaster  # noqa: E402
 
 rng = np.random.default_rng(42)
 interval_min = 5
@@ -77,3 +131,64 @@ print(f"Reference model MAE: {mae:.3f} kW")
 print(f"Persistence 168h MAE: {p168:.3f} kW")
 print(f"Delta vs persistence: {(mae - p168) / p168 * 100:.1f}%")
 print("Synthetic reference completed")
+
+
+def run_odd_minute_origin_training_test() -> None:
+    odd_start = datetime(2026, 1, 1, 10, 16, tzinfo=timezone.utc)
+    test_days = 12
+    periods = test_days * points_per_day
+    timestamps = [odd_start + timedelta(minutes=interval_min * i) for i in range(periods)]
+    test_hours = (np.arange(periods) * interval_min / 60.0 + odd_start.hour + odd_start.minute / 60.0) % 24
+    test_day_index = np.arange(periods) // points_per_day
+    test_weekend = ((test_day_index % 7) >= 5).astype(float)
+    test_load = (
+        0.65
+        + 0.35 * ((test_hours >= 6) & (test_hours <= 9))
+        + 0.75 * ((test_hours >= 17) & (test_hours <= 21))
+        + 0.15 * test_weekend
+        + rng.normal(0, 0.03, periods)
+    )
+    history = [
+        {"last_changed": ts.isoformat(), "state": f"{float(load):.5f}"}
+        for ts, load in zip(timestamps, test_load)
+    ]
+
+    app = PowerSyncMLForecaster.__new__(PowerSyncMLForecaster)
+    app.cfg = dict(DEFAULT_CFG)
+    app.cfg.update({
+        "load_sensor": "sensor.synthetic_odd_minute_load",
+        "load_unit_override": "kW",
+        "timezone": "UTC",
+        "base_interval_minutes": interval_min,
+        "training_origin_interval_minutes": 60,
+        "training_lead_interval_minutes": 15,
+        "horizon_hours": 48,
+        "weather_enabled": False,
+        "public_holiday_region": None,
+        "additional_feature_sensors": [],
+        "max_training_rows": 500000,
+    })
+    app.tz = timezone.utc
+    app.holiday_cal = None
+    app.log = lambda *_args, **_kwargs: None
+    app.get_state = lambda *_args, **_kwargs: "kW"
+
+    end = timestamps[-1]
+    base = app._build_base_frame({"load": history}, odd_start, end)
+    expected_first_index = pd.Timestamp("2026-01-01T10:15:00Z")
+    assert base.index[0] == expected_first_index, f"base index was not interval aligned: {base.index[0]}"
+
+    validation_cutoff = odd_start + timedelta(days=8)
+    train_rows, val_rows = app._build_origin_training_table(base, odd_start, end, validation_cutoff)
+    assert not train_rows.empty, "odd-minute synthetic history produced no training rows"
+    assert not val_rows.empty, "odd-minute synthetic history produced no validation rows"
+
+    shifted_base = base.copy()
+    shifted_base.index = shifted_base.index + pd.Timedelta(minutes=1)
+    shifted_train_rows, shifted_val_rows = app._build_origin_training_table(shifted_base, odd_start, end, validation_cutoff)
+    assert not shifted_train_rows.empty, "nearest origin matching produced no training rows"
+    assert not shifted_val_rows.empty, "nearest origin matching produced no validation rows"
+    print(f"Odd-minute origin rows: train={len(train_rows):,} validation={len(val_rows):,}")
+
+
+run_odd_minute_origin_training_test()

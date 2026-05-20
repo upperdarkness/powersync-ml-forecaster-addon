@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.2
+PowerSync ML Load Forecaster v4.2.1
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -57,6 +57,8 @@ OPEN_METEO_VARS = [
     "wind_speed_10m",
     "is_day",
 ]
+
+FORECASTER_VERSION = "4.2.1"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
@@ -157,6 +159,15 @@ def lead_bucket_name(lead_minutes: float) -> str:
     return "outside_horizon"
 
 
+def aligned_interval_bounds(start: datetime, end: datetime, interval_minutes: int) -> Tuple[pd.Timestamp, pd.Timestamp]:
+    freq = f"{int(interval_minutes)}min"
+    aligned_start = pd.to_datetime(start, utc=True).floor(freq)
+    aligned_end = pd.to_datetime(end, utc=True).ceil(freq)
+    if aligned_end < aligned_start:
+        aligned_end = aligned_start
+    return aligned_start, aligned_end
+
+
 class PowerSyncMLForecaster(hass.Hass):
     def initialize(self):
         self.cfg = self._read_config()
@@ -194,7 +205,7 @@ class PowerSyncMLForecaster(hass.Hass):
             self.cfg["update_minutes"] * 60,
         )
         self.log(
-            f"Initialized v4.2. load_sensor={self.cfg['load_sensor']} output={self.cfg['hafo_entity_id']}"
+            f"Initialized v{FORECASTER_VERSION}. load_sensor={self.cfg['load_sensor']} output={self.cfg['hafo_entity_id']}"
         )
 
     def _read_config(self) -> Dict[str, Any]:
@@ -279,7 +290,7 @@ class PowerSyncMLForecaster(hass.Hass):
             "training_frame_tail": tail,
             "validation_metrics": self.validation_metrics,
             "last_train_time": self.last_train_time,
-            "version": "4.2",
+            "version": FORECASTER_VERSION,
         }, self.model_path)
 
     def _train_validate_refit_and_forecast(self):
@@ -374,7 +385,8 @@ class PowerSyncMLForecaster(hass.Hass):
 
     def _build_base_frame(self, sensor_data: Dict[str, List[dict]], start: datetime, end: datetime) -> pd.DataFrame:
         interval = int(self.cfg["base_interval_minutes"])
-        idx = pd.date_range(start=start.replace(second=0, microsecond=0), end=end.replace(second=0, microsecond=0), freq=f"{interval}min", tz="UTC")
+        idx_start, idx_end = aligned_interval_bounds(start, end, interval)
+        idx = pd.date_range(start=idx_start, end=idx_end, freq=f"{interval}min")
         df = pd.DataFrame(index=idx)
         for key, hist in sensor_data.items():
             series = self._history_to_series(hist, idx, interval)
@@ -422,9 +434,12 @@ class PowerSyncMLForecaster(hass.Hass):
         leads = np.arange(lead_interval, horizon_minutes + 1, lead_interval, dtype=int)
         weather_hist = self._fetch_weather_training(start, end) if self.cfg["weather_enabled"] else pd.DataFrame()
         chunks = []
+        rejected_missing_origin_features = 0
+        rejected_missing_targets = 0
         for origin in origins:
             origin_features = self._features_known_at_origin(base, origin)
             if origin_features is None:
+                rejected_missing_origin_features += 1
                 continue
             rows = []
             for lead in leads:
@@ -446,7 +461,22 @@ class PowerSyncMLForecaster(hass.Hass):
                 rows.append(feat)
             if rows:
                 chunks.append(pd.DataFrame(rows))
+            else:
+                rejected_missing_targets += 1
         if not chunks:
+            self.log(
+                "No origin training rows built: "
+                f"candidate_origins={len(origins)} "
+                f"first_base_index={self._format_optional_timestamp(base.index.min() if len(base.index) else None)} "
+                f"last_base_index={self._format_optional_timestamp(base.index.max() if len(base.index) else None)} "
+                f"first_origin={self._format_optional_timestamp(origins[0] if len(origins) else None)} "
+                f"last_origin={self._format_optional_timestamp(origins[-1] if len(origins) else None)} "
+                f"interval_minutes={int(self.cfg['base_interval_minutes'])} "
+                f"training_lead_interval_minutes={lead_interval} "
+                f"rejected_missing_origin_features={rejected_missing_origin_features} "
+                f"rejected_missing_targets={rejected_missing_targets}",
+                level="ERROR",
+            )
             raise RuntimeError("No origin training rows built")
         table = pd.concat(chunks, ignore_index=True)
         table = table.replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -456,10 +486,11 @@ class PowerSyncMLForecaster(hass.Hass):
         return train, val
 
     def _features_known_at_origin(self, base: pd.DataFrame, origin: pd.Timestamp) -> Optional[Dict[str, float]]:
-        if origin not in base.index:
+        matched_origin = self._nearest_index_timestamp(base.index, origin)
+        if matched_origin is None:
             return None
         out: Dict[str, float] = {}
-        history = base.loc[:origin, "baseline_load_kw"].dropna()
+        history = base.loc[:matched_origin, "baseline_load_kw"].dropna()
         if len(history) < int(7 * 24 * 60 / self.cfg["base_interval_minutes"]):
             return None
         for hours in [1, 6, 24, 168]:
@@ -471,11 +502,11 @@ class PowerSyncMLForecaster(hass.Hass):
                     out[f"origin_rolling_std_{hours}h_kw"] = float(tail.std())
         for col in ["import_price", "feed_in_price", "ev_charging_flag"]:
             if col in base.columns:
-                out[f"origin_{col}"] = float(base.loc[origin, col]) if not pd.isna(base.loc[origin, col]) else 0.0
+                out[f"origin_{col}"] = float(base.loc[matched_origin, col]) if not pd.isna(base.loc[matched_origin, col]) else 0.0
         for extra in self.cfg.get("additional_feature_sensors") or []:
             col = safe_feature_name(extra)
             if col in base.columns:
-                out[f"origin_{col}"] = float(base.loc[origin, col]) if not pd.isna(base.loc[origin, col]) else 0.0
+                out[f"origin_{col}"] = float(base.loc[matched_origin, col]) if not pd.isna(base.loc[matched_origin, col]) else 0.0
                 out[f"origin_{col}_is_origin_value"] = 1.0
         return out
 
@@ -515,12 +546,30 @@ class PowerSyncMLForecaster(hass.Hass):
 
     def _lookup_series_value(self, series: pd.Series, ts: pd.Timestamp) -> float:
         try:
-            pos = series.index.get_indexer([ts], method="nearest", tolerance=pd.Timedelta(minutes=int(self.cfg["base_interval_minutes"] // 2 + 1)))[0]
-            if pos == -1:
+            matched_ts = self._nearest_index_timestamp(series.index, ts)
+            if matched_ts is None:
                 return np.nan
-            return float(series.iloc[pos])
+            return float(series.loc[matched_ts])
         except Exception:
             return np.nan
+
+    def _nearest_index_timestamp(self, index: pd.DatetimeIndex, ts: pd.Timestamp) -> Optional[pd.Timestamp]:
+        if len(index) == 0:
+            return None
+        tolerance = pd.Timedelta(minutes=float(self.cfg["base_interval_minutes"]) / 2.0)
+        try:
+            target = pd.to_datetime(ts, utc=True)
+            pos = index.get_indexer([target], method="nearest", tolerance=tolerance)[0]
+            if pos == -1:
+                return None
+            return index[pos]
+        except Exception:
+            return None
+
+    def _format_optional_timestamp(self, ts: Optional[pd.Timestamp]) -> Optional[str]:
+        if ts is None or pd.isna(ts):
+            return None
+        return pd.Timestamp(ts).isoformat()
 
     def _fetch_weather_training(self, start: datetime, end: datetime) -> pd.DataFrame:
         if not self.cfg.get("latitude") or not self.cfg.get("longitude"):
@@ -650,7 +699,7 @@ class PowerSyncMLForecaster(hass.Hass):
         train_lead_interval = int(self.cfg["training_lead_interval_minutes"])
         horizon_minutes = int(self.cfg["horizon_hours"] * 60)
         forecast_start = self._next_boundary(now, pub_interval)
-        # v4.2 Option C: predict at training lead resolution then interpolate to publish resolution.
+        # Predict at training lead resolution then interpolate to publish resolution.
         coarse_leads = np.arange(train_lead_interval, horizon_minutes + 1, train_lead_interval, dtype=int)
         coarse_times = [forecast_start + timedelta(minutes=int(lead)) for lead in coarse_leads]
         live_weather = self._fetch_weather_live(max(3, int(math.ceil(self.cfg["horizon_hours"] / 24)) + 1)) if self.cfg["weather_enabled"] else pd.DataFrame()
