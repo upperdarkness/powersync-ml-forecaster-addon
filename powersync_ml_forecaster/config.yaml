@@ -1,5 +1,5 @@
 name: PowerSync ML Forecaster
-version: "4.3.1"
+version: "4.4.0"
 slug: powersync_ml_forecaster
 description: ML baseline household load forecaster that publishes a HAFO-compatible forecast sensor for PowerSync.
 url: https://github.com/upperdarkness/powersync-ml-forecaster-addon
