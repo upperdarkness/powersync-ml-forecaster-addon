@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.4.0
+PowerSync ML Load Forecaster v4.5.0
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -58,7 +58,7 @@ OPEN_METEO_VARS = [
     "is_day",
 ]
 
-FORECASTER_VERSION = "4.4.0"
+FORECASTER_VERSION = "4.5.0"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
@@ -79,13 +79,13 @@ DEFAULT_CFG: Dict[str, Any] = {
     "minimum_training_days": 45,
     "horizon_hours": 48,
     "base_interval_minutes": 5,
-    "training_origin_interval_minutes": 60,
-    "training_lead_interval_minutes": 15,
+    "training_origin_interval_minutes": 120,
+    "training_lead_interval_minutes": 30,
     "publish_interval_minutes": 5,
     "retrain_minutes": 360,
     "update_minutes": 15,
     "validation_days": 14,
-    "max_training_rows": 250000,
+    "max_training_rows": 75000,
     "subsample_strategy": "stratified_by_lead_bucket",
     "history_fetch_chunk_days": 7,
     "max_total_history_fetch_seconds": 600,
@@ -104,7 +104,7 @@ DEFAULT_CFG: Dict[str, Any] = {
     "ev_artifact_min_mae_improvement_pct": 20.0,
     "ha_url": None,
     "ha_token": None,
-    "model_max_iter": 300,
+    "model_max_iter": 120,
     "model_learning_rate": 0.06,
     "model_max_depth": 6,
     "model_min_samples_leaf": 20,
@@ -184,6 +184,8 @@ class PowerSyncMLForecaster(hass.Hass):
         self.data_dir = Path(self.cfg["data_dir"])
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.model_path = self.data_dir / "model_cache.joblib"
+        self.base_frame_cache_path = self.data_dir / "base_frame_cache.parquet"
+        self.weather_cache_path = self.data_dir / "weather_cache.parquet"
         self.snapshot_path = self.data_dir / "forecast_snapshots.jsonl"
         self.latest_forecast_path = self.data_dir / "latest_forecast.json"
         self.feature_cols: List[str] = []
@@ -314,10 +316,12 @@ class PowerSyncMLForecaster(hass.Hass):
         }, self.model_path)
 
     def _train_validate_refit_and_forecast(self):
+        stage_t0 = time.time()
         now = utc_now()
         start = now - timedelta(days=int(self.cfg["days_back"]))
-        sensor_data = self._fetch_all_histories_chunked(start, now)
-        base = self._build_base_frame(sensor_data, start, now)
+        base = self._load_or_build_base_frame(start, now)
+        self._log_stage_elapsed("history fetch + base frame construction", stage_t0)
+        stage_t0 = time.time()
         required_points = self.cfg["minimum_training_days"] * 24 * 60 // self.cfg["base_interval_minutes"]
         if len(base.dropna(subset=["baseline_load_kw"])) < required_points:
             raise RuntimeError(self._insufficient_history_message(base))
@@ -329,7 +333,9 @@ class PowerSyncMLForecaster(hass.Hass):
         )
 
         validation_cutoff = now - timedelta(days=int(self.cfg["validation_days"]))
+        stage_t0 = time.time()
         train_rows, val_rows = self._build_origin_training_table(base, start, now, validation_cutoff)
+        self._log_stage_elapsed("origin training table construction", stage_t0)
         if train_rows.empty or val_rows.empty:
             raise RuntimeError("Unable to build non-empty train and validation tables")
         self.log(f"Built origin training rows: train={len(train_rows)} validation={len(val_rows)}")
@@ -337,8 +343,10 @@ class PowerSyncMLForecaster(hass.Hass):
         model_for_validation = self._new_model()
         self.feature_cols = [c for c in train_rows.columns if c not in ("target_load_kw", "target_time", "origin_time", "lead_bucket")]
         self.log(f"Fitting validation model: rows={len(train_rows)} features={len(self.feature_cols)}")
+        stage_t0 = time.time()
         model_for_validation.fit(train_rows[self.feature_cols].astype(float), train_rows["target_load_kw"].astype(float))
         val_pred = np.clip(model_for_validation.predict(val_rows[self.feature_cols].astype(float)), 0, None)
+        self._log_stage_elapsed("validation fit", stage_t0)
         self.validation_metrics = self._compute_validation_metrics(val_rows, val_pred)
         self._check_quality_gate(self.validation_metrics)
 
@@ -346,9 +354,56 @@ class PowerSyncMLForecaster(hass.Hass):
         all_rows = pd.concat([train_rows, val_rows], ignore_index=True)
         all_rows = self._subsample_training_rows(all_rows)
         self.log(f"Fitting final model: rows={len(all_rows)} features={len(self.feature_cols)}")
+        stage_t0 = time.time()
         self.model = self._new_model()
         self.model.fit(all_rows[self.feature_cols].astype(float), all_rows["target_load_kw"].astype(float))
+        self._log_stage_elapsed("final fit", stage_t0)
         self.log("Final model fit complete")
+
+    def _log_stage_elapsed(self, stage_name: str, t0: float):
+        self.log(f"Training stage '{stage_name}' elapsed_seconds={time.time() - t0:.3f}")
+
+    def _load_or_build_base_frame(self, start: datetime, end: datetime) -> pd.DataFrame:
+        t0 = time.time()
+        cached = self._read_base_frame_cache()
+        sensor_data: Dict[str, List[dict]]
+        if cached is not None and not cached.empty:
+            latest_cached = cached.index.max().to_pydatetime()
+            fetch_start = max(start, latest_cached - timedelta(minutes=int(self.cfg["base_interval_minutes"]) * 2))
+            sensor_data = self._fetch_all_histories_chunked(fetch_start, end)
+            self._log_stage_elapsed("history fetch", t0)
+            t1 = time.time()
+            new_base = self._build_base_frame(sensor_data, fetch_start, end)
+            merged = pd.concat([cached[cached.index < new_base.index.min()], new_base]).sort_index()
+            merged = merged[~merged.index.duplicated(keep="last")]
+            merged = merged[merged.index >= pd.to_datetime(start, utc=True)]
+            self._write_base_frame_cache(merged)
+            self._log_stage_elapsed("base frame construction", t1)
+            return merged
+        sensor_data = self._fetch_all_histories_chunked(start, end)
+        self._log_stage_elapsed("history fetch", t0)
+        t1 = time.time()
+        base = self._build_base_frame(sensor_data, start, end)
+        self._write_base_frame_cache(base)
+        self._log_stage_elapsed("base frame construction", t1)
+        return base
+
+    def _read_base_frame_cache(self) -> Optional[pd.DataFrame]:
+        if not self.base_frame_cache_path.exists():
+            return None
+        try:
+            cached = pd.read_parquet(self.base_frame_cache_path)
+            cached.index = pd.to_datetime(cached.index, utc=True)
+            return cached.sort_index()
+        except Exception as e:
+            self.log(f"Base frame cache read failed: {e}", level="WARNING")
+            return None
+
+    def _write_base_frame_cache(self, df: pd.DataFrame):
+        try:
+            df.to_parquet(self.base_frame_cache_path)
+        except Exception as e:
+            self.log(f"Base frame cache write failed: {e}", level="WARNING")
 
     def _new_model(self) -> HistGradientBoostingRegressor:
         return HistGradientBoostingRegressor(
@@ -479,7 +534,9 @@ class PowerSyncMLForecaster(hass.Hass):
         df["ev_excluded_kw"] = np.where(charging, df["ev_power_kw"], 0.0)
         df["baseline_load_kw"] = np.where(detailed_load, np.maximum(df["raw_load_kw"] - df["ev_excluded_kw"], 0), df["raw_load_kw"])
         df["ev_charging_flag"] = charging.astype(float)
+        t0 = time.time()
         df = self._apply_load_anomaly_filter(df)
+        self._log_stage_elapsed("load anomaly filtering", t0)
         self.history_diagnostics = self._history_diagnostics(df, start, end)
         self.log(f"History diagnostics: {json.dumps(self.history_diagnostics, sort_keys=True)}")
         mem_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
@@ -638,68 +695,80 @@ class PowerSyncMLForecaster(hass.Hass):
         latest_origin = base.index.max() - pd.Timedelta(minutes=horizon_minutes)
         origins = pd.date_range(earliest_origin.ceil(f"{origin_interval}min"), latest_origin.floor(f"{origin_interval}min"), freq=f"{origin_interval}min", tz="UTC")
         leads = np.arange(lead_interval, horizon_minutes + 1, lead_interval, dtype=int)
+        t0 = time.time()
         weather_hist = self._fetch_weather_training(start, end) if self.cfg["weather_enabled"] else pd.DataFrame()
+        self._log_stage_elapsed("historical weather fetch", t0)
         self.log(
             "Building origin training table: "
             f"candidate_origins={len(origins)} leads_per_origin={len(leads)} "
             f"estimated_max_rows={len(origins) * len(leads)}"
         )
-        chunks = []
-        rejected_missing_origin_features = 0
-        rejected_missing_targets = 0
-        progress_started = time.time()
-        for origin_idx, origin in enumerate(origins, start=1):
-            origin_features = self._features_known_at_origin(base, origin)
-            if origin_features is None:
-                rejected_missing_origin_features += 1
-                continue
-            rows = []
-            for lead in leads:
-                target_time = origin + pd.Timedelta(minutes=int(lead))
-                target = self._lookup_series_value(base["cleaned_baseline_load_kw"], target_time)
-                if pd.isna(target):
-                    continue
-                feat = dict(origin_features)
-                feat.update(self._calendar_features(target_time))
-                feat.update(self._valid_target_lag_features(base, origin, target_time))
-                feat.update(self._weather_features(weather_hist, target_time))
-                feat["lead_minutes"] = float(lead)
-                feat["lead_sin"] = math.sin(2 * math.pi * lead / horizon_minutes)
-                feat["lead_cos"] = math.cos(2 * math.pi * lead / horizon_minutes)
-                feat["target_load_kw"] = float(target)
-                feat["origin_time"] = origin
-                feat["target_time"] = target_time
-                feat["lead_bucket"] = lead_bucket_name(lead)
-                rows.append(feat)
-            if rows:
-                chunks.append(pd.DataFrame(rows))
-            else:
-                rejected_missing_targets += 1
-            if origin_idx % 250 == 0 or (time.time() - progress_started > 60 and origin_idx < len(origins)):
-                built_rows = sum(len(chunk) for chunk in chunks)
-                self.log(
-                    "Origin training progress: "
-                    f"origins_processed={origin_idx}/{len(origins)} rows_built={built_rows} "
-                    f"rejected_missing_origin_features={rejected_missing_origin_features} "
-                    f"rejected_missing_targets={rejected_missing_targets}"
-                )
-                progress_started = time.time()
-        if not chunks:
-            self.log(
-                "No origin training rows built: "
-                f"candidate_origins={len(origins)} "
-                f"first_base_index={self._format_optional_timestamp(base.index.min() if len(base.index) else None)} "
-                f"last_base_index={self._format_optional_timestamp(base.index.max() if len(base.index) else None)} "
-                f"first_origin={self._format_optional_timestamp(origins[0] if len(origins) else None)} "
-                f"last_origin={self._format_optional_timestamp(origins[-1] if len(origins) else None)} "
-                f"interval_minutes={int(self.cfg['base_interval_minutes'])} "
-                f"training_lead_interval_minutes={lead_interval} "
-                f"rejected_missing_origin_features={rejected_missing_origin_features} "
-                f"rejected_missing_targets={rejected_missing_targets}",
-                level="ERROR",
-            )
-            raise RuntimeError("No origin training rows built")
-        table = pd.concat(chunks, ignore_index=True)
+        origin_df = pd.DataFrame({"origin_time": np.repeat(origins.to_numpy(), len(leads)), "lead_minutes": np.tile(leads, len(origins)).astype(float)})
+        origin_feat = pd.DataFrame(index=origins)
+        for hours in [1, 6, 24, 168]:
+            window = max(1, int(hours * 60 / self.cfg["base_interval_minutes"]))
+            origin_feat[f"origin_rolling_mean_{hours}h_kw"] = base["cleaned_baseline_load_kw"].rolling(window=window, min_periods=max(2, window // 2)).mean().reindex(origins)
+            if hours >= 24:
+                origin_feat[f"origin_rolling_std_{hours}h_kw"] = base["cleaned_baseline_load_kw"].rolling(window=window, min_periods=max(2, window // 2)).std().reindex(origins)
+        for col in ["import_price", "feed_in_price", "ev_charging_flag"]:
+            if col in base.columns:
+                origin_feat[f"origin_{col}"] = base[col].reindex(origins)
+        for extra in self.cfg.get("additional_feature_sensors") or []:
+            col = safe_feature_name(extra)
+            if col in base.columns:
+                origin_feat[f"origin_{col}"] = base[col].reindex(origins)
+                origin_feat[f"origin_{col}_is_origin_value"] = 1.0
+        origin_feat["origin_history_ok"] = (
+            base["cleaned_baseline_load_kw"].notna().rolling(window=max(1, int(7 * 24 * 60 / self.cfg["base_interval_minutes"])), min_periods=1).sum().reindex(origins)
+            >= int(7 * 24 * 60 / self.cfg["base_interval_minutes"])
+        )
+        origin_df = origin_df.merge(origin_feat.reset_index().rename(columns={"index": "origin_time"}), on="origin_time", how="left")
+        origin_df = origin_df[origin_df["origin_history_ok"]].drop(columns=["origin_history_ok"])
+        origin_df["target_time"] = pd.to_datetime(origin_df["origin_time"], utc=True) + pd.to_timedelta(origin_df["lead_minutes"], unit="m")
+        target_map = base[["cleaned_baseline_load_kw"]].rename(columns={"cleaned_baseline_load_kw": "target_load_kw"})
+        table = origin_df.merge(target_map, left_on="target_time", right_index=True, how="left")
+        table = table[table["target_load_kw"].notna()].copy()
+        local = table["target_time"].dt.tz_convert(self.tz)
+        hour = local.dt.hour + local.dt.minute / 60.0
+        dow = local.dt.dayofweek
+        month = local.dt.month
+        doy = local.dt.dayofyear
+        table["target_hour_sin"] = np.sin(2 * math.pi * hour / 24.0)
+        table["target_hour_cos"] = np.cos(2 * math.pi * hour / 24.0)
+        table["target_dow_sin"] = np.sin(2 * math.pi * dow / 7.0)
+        table["target_dow_cos"] = np.cos(2 * math.pi * dow / 7.0)
+        table["target_month_sin"] = np.sin(2 * math.pi * (month - 1) / 12.0)
+        table["target_month_cos"] = np.cos(2 * math.pi * (month - 1) / 12.0)
+        table["target_doy_sin"] = np.sin(2 * math.pi * doy / 365.0)
+        table["target_doy_cos"] = np.cos(2 * math.pi * doy / 365.0)
+        table["target_is_weekend"] = (dow >= 5).astype(float)
+        date_vals = local.dt.date
+        if self.holiday_cal is not None:
+            table["target_is_public_holiday"] = date_vals.map(lambda d: 1.0 if d in self.holiday_cal else 0.0)
+            table["target_day_before_holiday"] = date_vals.map(lambda d: 1.0 if (d + timedelta(days=1)) in self.holiday_cal else 0.0)
+        else:
+            table["target_is_public_holiday"] = 0.0
+            table["target_day_before_holiday"] = 0.0
+        series_col = "cleaned_baseline_load_kw" if self.cfg.get("clean_contaminated_lags", True) and "cleaned_baseline_load_kw" in base else "baseline_load_kw"
+        for hours in [24, 48, 168]:
+            lagged = base[[series_col, "load_contaminated"]].copy()
+            lagged.index = lagged.index + pd.Timedelta(hours=hours)
+            lagged = lagged.rename(columns={series_col: f"target_lag_{hours}h_kw", "load_contaminated": f"lag_{hours}h_contaminated"})
+            table = table.merge(lagged, left_on="target_time", right_index=True, how="left")
+            valid = (table["target_time"] - pd.Timedelta(hours=hours)) <= table["origin_time"]
+            table[f"target_lag_{hours}h_valid"] = (valid & table[f"target_lag_{hours}h_kw"].notna()).astype(float)
+            table.loc[~valid, f"target_lag_{hours}h_kw"] = np.nan
+            table[f"lag_{hours}h_contaminated"] = np.where(valid & table[f"lag_{hours}h_contaminated"].fillna(0).ge(0.5), 1.0, 0.0)
+        if not weather_hist.empty:
+            wx = weather_hist.reset_index().rename(columns={"timestamp": "weather_time"})
+            table = pd.merge_asof(table.sort_values("target_time"), wx.sort_values("weather_time"), left_on="target_time", right_on="weather_time", direction="nearest", tolerance=pd.Timedelta(minutes=65))
+        for v in OPEN_METEO_VARS:
+            col = f"wx_{v}"
+            if col not in table.columns:
+                table[col] = 0.0
+        table["lead_sin"] = np.sin(2 * math.pi * table["lead_minutes"] / horizon_minutes)
+        table["lead_cos"] = np.cos(2 * math.pi * table["lead_minutes"] / horizon_minutes)
+        table["lead_bucket"] = table["lead_minutes"].map(lead_bucket_name)
         table = table.replace([np.inf, -np.inf], np.nan).fillna(0.0)
         train, val = self._split_train_validation_rows(table, validation_cutoff)
         if train.empty or val.empty:
@@ -839,6 +908,11 @@ class PowerSyncMLForecaster(hass.Hass):
     def _fetch_weather_training(self, start: datetime, end: datetime) -> pd.DataFrame:
         if not self.cfg.get("latitude") or not self.cfg.get("longitude"):
             return pd.DataFrame()
+        cached = self._read_weather_cache()
+        if cached is not None and not cached.empty:
+            cache_slice = cached[(cached.index >= pd.to_datetime(start, utc=True)) & (cached.index <= pd.to_datetime(end, utc=True))]
+            if not cache_slice.empty and cache_slice.index.min() <= pd.to_datetime(start, utc=True) and cache_slice.index.max() >= pd.to_datetime(end, utc=True):
+                return cache_slice
         params = {
             "latitude": self.cfg["latitude"],
             "longitude": self.cfg["longitude"],
@@ -848,7 +922,31 @@ class PowerSyncMLForecaster(hass.Hass):
             "timezone": "UTC",
             "wind_speed_unit": "kmh",
         }
-        return self._fetch_weather_df(HISTORICAL_FORECAST_URL, params)
+        fetched = self._fetch_weather_df(HISTORICAL_FORECAST_URL, params)
+        if fetched.empty:
+            return fetched
+        if cached is not None and not cached.empty:
+            fetched = pd.concat([cached, fetched]).sort_index()
+            fetched = fetched[~fetched.index.duplicated(keep="last")]
+        self._write_weather_cache(fetched)
+        return fetched[(fetched.index >= pd.to_datetime(start, utc=True)) & (fetched.index <= pd.to_datetime(end, utc=True))]
+
+    def _read_weather_cache(self) -> Optional[pd.DataFrame]:
+        if not self.weather_cache_path.exists():
+            return None
+        try:
+            cached = pd.read_parquet(self.weather_cache_path)
+            cached.index = pd.to_datetime(cached.index, utc=True)
+            return cached.sort_index()
+        except Exception as e:
+            self.log(f"Weather cache read failed: {e}", level="WARNING")
+            return None
+
+    def _write_weather_cache(self, df: pd.DataFrame):
+        try:
+            df.to_parquet(self.weather_cache_path)
+        except Exception as e:
+            self.log(f"Weather cache write failed: {e}", level="WARNING")
 
     def _fetch_weather_live(self, forecast_days: int) -> pd.DataFrame:
         if not self.cfg.get("latitude") or not self.cfg.get("longitude"):
@@ -957,6 +1055,7 @@ class PowerSyncMLForecaster(hass.Hass):
         raise RuntimeError(f"Quality gate failed. Metrics: {json.dumps(metrics)[:1000]}")
 
     def _refresh_forecast(self):
+        stage_t0 = time.time()
         entity_id = self.cfg["hafo_entity_id"]
         self.log(f"Generating forecast for {entity_id}")
         if self.model is None:
@@ -1008,6 +1107,7 @@ class PowerSyncMLForecaster(hass.Hass):
         self._publish_forecast(forecast, preds_publish, daily_totals)
         self._write_latest_forecast(forecast)
         self._append_snapshot(forecast)
+        self._log_stage_elapsed("forecast generation", stage_t0)
 
     def _next_boundary(self, dt: datetime, interval_minutes: int) -> datetime:
         epoch = int(dt.timestamp())
