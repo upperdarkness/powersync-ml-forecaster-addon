@@ -341,7 +341,11 @@ class PowerSyncMLForecaster(hass.Hass):
         self.log(f"Built origin training rows: train={len(train_rows)} validation={len(val_rows)}")
 
         model_for_validation = self._new_model()
-        self.feature_cols = [c for c in train_rows.columns if c not in ("target_load_kw", "target_time", "origin_time", "lead_bucket")]
+        candidate_feature_cols = [c for c in train_rows.columns if c not in ("target_load_kw", "target_time", "origin_time", "lead_bucket")]
+        self.feature_cols = [c for c in candidate_feature_cols if pd.api.types.is_numeric_dtype(train_rows[c])]
+        dropped_non_numeric = sorted(set(candidate_feature_cols) - set(self.feature_cols))
+        if dropped_non_numeric:
+            self.log(f"Dropping non-numeric training features: {', '.join(dropped_non_numeric)}", level="WARNING")
         self.log(f"Fitting validation model: rows={len(train_rows)} features={len(self.feature_cols)}")
         stage_t0 = time.time()
         model_for_validation.fit(train_rows[self.feature_cols].astype(float), train_rows["target_load_kw"].astype(float))
