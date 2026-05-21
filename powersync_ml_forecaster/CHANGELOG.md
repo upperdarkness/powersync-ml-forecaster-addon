@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.4.0
+
+- Add load-only sustained anomaly masking to protect baseline/lag features from one-off EV-like overnight contamination when `ev_power_sensor` is unavailable.
+- Build `cleaned_baseline_load_kw` and use it for target, lag, and rolling-origin feature generation; add lag contamination features for 24h/48h/168h lags.
+- Publish load anomaly diagnostics and event logging while preserving HAFO schema and PowerSync forecast entity compatibility.
+
 ## 4.3.1
 
 - Add progress logging for larger statistics-backed training runs.
