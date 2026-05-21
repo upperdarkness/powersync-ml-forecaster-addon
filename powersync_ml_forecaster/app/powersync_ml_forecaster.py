@@ -1,5 +1,5 @@
 """
-PowerSync ML Load Forecaster v4.3.1
+PowerSync ML Load Forecaster v4.4.0
 
 AppDaemon 4 application that publishes a HAFO-compatible baseline load forecast
 sensor for PowerSync. The model excludes EV charging from the training target and
@@ -58,7 +58,7 @@ OPEN_METEO_VARS = [
     "is_day",
 ]
 
-FORECASTER_VERSION = "4.3.1"
+FORECASTER_VERSION = "4.4.0"
 
 DEFAULT_CFG: Dict[str, Any] = {
     "hafo_entity_id": "sensor.hafo_power_sync_home_load_forecast",
@@ -108,6 +108,15 @@ DEFAULT_CFG: Dict[str, Any] = {
     "model_learning_rate": 0.06,
     "model_max_depth": 6,
     "model_min_samples_leaf": 20,
+    "load_anomaly_filter_enabled": True,
+    "load_anomaly_min_residual_kw": 1.5,
+    "load_anomaly_mad_multiplier": 6.0,
+    "load_anomaly_min_duration_minutes": 30,
+    "load_anomaly_buffer_before_minutes": 15,
+    "load_anomaly_buffer_after_minutes": 60,
+    "load_anomaly_max_daily_fraction": 0.35,
+    "load_anomaly_replacement": "time_of_week_median",
+    "clean_contaminated_lags": True,
 }
 
 LEAD_BUCKETS = [
@@ -182,6 +191,7 @@ class PowerSyncMLForecaster(hass.Hass):
         self.training_frame: Optional[pd.DataFrame] = None
         self.validation_metrics: Dict[str, Any] = {}
         self.history_diagnostics: Dict[str, Any] = {}
+        self.load_anomaly_diagnostics: Dict[str, Any] = {}
         self.last_train_time: Optional[datetime] = None
         self.last_error: Optional[str] = None
         self.holiday_cal = self._build_holiday_calendar()
@@ -469,11 +479,75 @@ class PowerSyncMLForecaster(hass.Hass):
         df["ev_excluded_kw"] = np.where(charging, df["ev_power_kw"], 0.0)
         df["baseline_load_kw"] = np.where(detailed_load, np.maximum(df["raw_load_kw"] - df["ev_excluded_kw"], 0), df["raw_load_kw"])
         df["ev_charging_flag"] = charging.astype(float)
+        df = self._apply_load_anomaly_filter(df)
         self.history_diagnostics = self._history_diagnostics(df, start, end)
         self.log(f"History diagnostics: {json.dumps(self.history_diagnostics, sort_keys=True)}")
         mem_mb = df.memory_usage(deep=True).sum() / 1024 / 1024
         if mem_mb > float(self.cfg["max_training_frame_mb"]):
             raise RuntimeError(f"Prepared base frame memory {mem_mb:.1f} MB exceeds limit")
+        return df
+
+    def _apply_load_anomaly_filter(self, df: pd.DataFrame) -> pd.DataFrame:
+        self.load_anomaly_diagnostics = {
+            "load_anomaly_filter_enabled": bool(self.cfg.get("load_anomaly_filter_enabled", True)),
+            "load_anomaly_events_last_training": 0,
+            "load_anomaly_intervals_masked": 0,
+            "load_anomaly_kwh_masked": 0.0,
+            "load_anomaly_replacement": self.cfg.get("load_anomaly_replacement", "time_of_week_median"),
+            "contaminated_lag_values_replaced": 0,
+        }
+        df["load_contaminated"] = False
+        df["cleaned_baseline_load_kw"] = df["baseline_load_kw"]
+        if not self.cfg.get("load_anomaly_filter_enabled", True):
+            return df
+        local = df.index.tz_convert(self.tz)
+        slots_per_day = max(1, int(round(1440 / int(self.cfg["base_interval_minutes"]))))
+        slot = local.hour * 60 + local.minute
+        keys = pd.MultiIndex.from_arrays([local.dayofweek, slot])
+        med_map = df.groupby(keys)["baseline_load_kw"].median()
+        expected = keys.map(med_map).astype(float)
+        residual = (df["baseline_load_kw"] - expected).fillna(0.0)
+        mad_map = residual.groupby(keys).apply(lambda s: float(np.nanmedian(np.abs(s - np.nanmedian(s)))) if len(s) else 0.0)
+        mad = keys.map(mad_map).astype(float)
+        min_residual = float(self.cfg["load_anomaly_min_residual_kw"])
+        mad_mult = float(self.cfg["load_anomaly_mad_multiplier"])
+        threshold = np.maximum(min_residual, mad_mult * mad)
+        candidate = residual >= threshold
+        min_points = max(1, int(math.ceil(float(self.cfg["load_anomaly_min_duration_minutes"]) / float(self.cfg["base_interval_minutes"]))))
+        grp = (candidate != candidate.shift(fill_value=False)).cumsum()
+        run_len = candidate.groupby(grp).transform("sum")
+        sustained = candidate & (run_len >= min_points)
+        before = max(0, int(math.ceil(float(self.cfg["load_anomaly_buffer_before_minutes"]) / float(self.cfg["base_interval_minutes"]))))
+        after = max(0, int(math.ceil(float(self.cfg["load_anomaly_buffer_after_minutes"]) / float(self.cfg["base_interval_minutes"]))))
+        mask = sustained.copy()
+        for i in range(1, before + 1):
+            mask |= sustained.shift(-i, fill_value=False)
+        for i in range(1, after + 1):
+            mask |= sustained.shift(i, fill_value=False)
+        max_daily_fraction = float(self.cfg["load_anomaly_max_daily_fraction"])
+        max_daily_points = int(math.floor(max_daily_fraction * slots_per_day))
+        dates = pd.Series(local.date, index=df.index)
+        for d in dates.unique():
+            day_mask = dates == d
+            if int(mask[day_mask].sum()) > max_daily_points > 0:
+                mask.loc[day_mask] = False
+        df["load_contaminated"] = mask.astype(bool)
+        replacement = expected
+        df.loc[df["load_contaminated"], "cleaned_baseline_load_kw"] = replacement[df["load_contaminated"]]
+        masked_kwh = float(df.loc[df["load_contaminated"], "baseline_load_kw"].fillna(0.0).sum() * int(self.cfg["base_interval_minutes"]) / 60.0)
+        self.load_anomaly_diagnostics["load_anomaly_intervals_masked"] = int(df["load_contaminated"].sum())
+        self.load_anomaly_diagnostics["load_anomaly_kwh_masked"] = round(masked_kwh, 3)
+        event_groups = (df["load_contaminated"] != df["load_contaminated"].shift(fill_value=False)).cumsum()
+        events = []
+        for _, g in df[df["load_contaminated"]].groupby(event_groups):
+            start_ts = g.index.min()
+            end_ts = g.index.max()
+            duration = int((end_ts - start_ts).total_seconds() / 60) + int(self.cfg["base_interval_minutes"])
+            peak_kw = float(g["baseline_load_kw"].max())
+            est_kwh = float(g["baseline_load_kw"].sum() * int(self.cfg["base_interval_minutes"]) / 60.0)
+            events.append((start_ts, end_ts, duration, peak_kw, est_kwh))
+            self.log(f"Load anomaly event start={start_ts.isoformat()} end={end_ts.isoformat()} duration_minutes={duration} peak_kw={peak_kw:.3f} estimated_masked_kwh={est_kwh:.3f}")
+        self.load_anomaly_diagnostics["load_anomaly_events_last_training"] = len(events)
         return df
 
     def _history_to_series(self, hist: List[dict], idx: pd.DatetimeIndex, interval: int) -> Optional[pd.Series]:
@@ -519,7 +593,7 @@ class PowerSyncMLForecaster(hass.Hass):
         counts = {str(k): int(v) for k, v in base["history_source"].fillna("missing").value_counts().to_dict().items()}
         detailed_days = self._span_days(base.index[base["history_source"] == "detailed_state"])
         stats_days = self._span_days(base.index[base["history_source"].isin(["short_term_statistics", "long_term_statistics"])])
-        usable_points = int(base["baseline_load_kw"].notna().sum())
+        usable_points = int(base["cleaned_baseline_load_kw"].notna().sum())
         usable_days = round(usable_points * int(self.cfg["base_interval_minutes"]) / 1440.0, 2)
         return {
             "detailed_history_days_available": detailed_days,
@@ -582,7 +656,7 @@ class PowerSyncMLForecaster(hass.Hass):
             rows = []
             for lead in leads:
                 target_time = origin + pd.Timedelta(minutes=int(lead))
-                target = self._lookup_series_value(base["baseline_load_kw"], target_time)
+                target = self._lookup_series_value(base["cleaned_baseline_load_kw"], target_time)
                 if pd.isna(target):
                     continue
                 feat = dict(origin_features)
@@ -678,7 +752,7 @@ class PowerSyncMLForecaster(hass.Hass):
         if matched_origin is None:
             return None
         out: Dict[str, float] = {}
-        history = base.loc[:matched_origin, "baseline_load_kw"].dropna()
+        history = base.loc[:matched_origin, "cleaned_baseline_load_kw"].dropna()
         if len(history) < int(7 * 24 * 60 / self.cfg["base_interval_minutes"]):
             return None
         for hours in [1, 6, 24, 168]:
@@ -727,9 +801,12 @@ class PowerSyncMLForecaster(hass.Hass):
         for hours in [24, 48, 168]:
             lag_time = target_time - pd.Timedelta(hours=hours)
             valid = lag_time <= origin
-            val = self._lookup_series_value(base["baseline_load_kw"], lag_time) if valid else np.nan
+            lag_flag = self._lookup_series_value(base["load_contaminated"].astype(float), lag_time) if valid and "load_contaminated" in base else 0.0
+            series_col = "cleaned_baseline_load_kw" if self.cfg.get("clean_contaminated_lags", True) and "cleaned_baseline_load_kw" in base else "baseline_load_kw"
+            val = self._lookup_series_value(base[series_col], lag_time) if valid else np.nan
             out[f"target_lag_{hours}h_kw"] = 0.0 if pd.isna(val) else float(val)
             out[f"target_lag_{hours}h_valid"] = 1.0 if valid and not pd.isna(val) else 0.0
+            out[f"lag_{hours}h_contaminated"] = 1.0 if valid and float(lag_flag) >= 0.5 else 0.0
         return out
 
     def _lookup_series_value(self, series: pd.Series, ts: pd.Timestamp) -> float:
@@ -981,6 +1058,12 @@ class PowerSyncMLForecaster(hass.Hass):
             "price_training_mode": self.cfg["price_training_mode"],
             "ev_exclusion_threshold_kw": self.cfg["ev_exclusion_threshold_kw"],
             "ev_excluded_kwh_last_training": self._ev_excluded_kwh(),
+            "load_anomaly_filter_enabled": self.load_anomaly_diagnostics.get("load_anomaly_filter_enabled"),
+            "load_anomaly_events_last_training": self.load_anomaly_diagnostics.get("load_anomaly_events_last_training"),
+            "load_anomaly_intervals_masked": self.load_anomaly_diagnostics.get("load_anomaly_intervals_masked"),
+            "load_anomaly_kwh_masked": self.load_anomaly_diagnostics.get("load_anomaly_kwh_masked"),
+            "load_anomaly_replacement": self.load_anomaly_diagnostics.get("load_anomaly_replacement"),
+            "contaminated_lag_values_replaced": self._contaminated_lag_values_replaced(),
             "daily_forecast_kwh": {k: round(v, 2) for k, v in daily_totals.items()},
         }
         state = str(round(float(predictions[0]), 3)) if len(predictions) else "0"
@@ -995,6 +1078,14 @@ class PowerSyncMLForecaster(hass.Hass):
         if self.training_frame is None or "ev_excluded_kw" not in self.training_frame:
             return None
         return round(float(self.training_frame["ev_excluded_kw"].sum() * self.cfg["base_interval_minutes"] / 60.0), 3)
+
+    def _contaminated_lag_values_replaced(self) -> int:
+        if self.training_frame is None:
+            return 0
+        cols = [c for c in ["lag_24h_contaminated", "lag_48h_contaminated", "lag_168h_contaminated"] if c in self.training_frame.columns]
+        if not cols:
+            return 0
+        return int(self.training_frame[cols].sum().sum())
 
 
     def _write_latest_forecast(self, forecast: List[dict]):
