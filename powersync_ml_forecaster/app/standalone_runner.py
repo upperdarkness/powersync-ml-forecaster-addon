@@ -161,15 +161,34 @@ class StandaloneForecaster(PowerSyncMLForecaster):
     def set_state(self, entity_id: str, state: str, attributes: Optional[Dict[str, Any]] = None) -> int:
         payload = {"state": state, "attributes": attributes or {}}
         url = self._url(f"/api/states/{entity_id}")
-        r = self._session.post(url, headers=self._headers, json=payload, timeout=20)
-        if r.status_code >= 400:
+        max_attempts = 3
+        retryable_status_codes = {429, 500, 502, 503, 504}
+
+        for attempt in range(1, max_attempts + 1):
+            r = self._session.post(url, headers=self._headers, json=payload, timeout=20)
+            if r.status_code < 400:
+                return int(r.status_code)
+
             body = (r.text or "")[:500]
+            is_retryable = r.status_code in retryable_status_codes
+            should_retry = is_retryable and attempt < max_attempts
+
+            level = "WARNING" if should_retry else "ERROR"
             self.log(
-                f"Home Assistant state publish failed for {entity_id}: status={r.status_code} body={body}",
-                level="ERROR",
+                (
+                    f"Home Assistant state publish failed for {entity_id}: status={r.status_code} "
+                    f"attempt={attempt}/{max_attempts} body={body}"
+                ),
+                level=level,
             )
+
+            if should_retry:
+                time.sleep(1.0 * attempt)
+                continue
+
             r.raise_for_status()
-        return int(r.status_code)
+
+        raise RuntimeError(f"Failed to publish state for {entity_id}: retries exhausted unexpectedly")
 
     def get_history(self, entity_id: str, start_time: str, end_time: str, **_: Any) -> Any:
         params = {
